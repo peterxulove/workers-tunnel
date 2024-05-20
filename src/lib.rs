@@ -1,5 +1,5 @@
 use crate::proxy::{parse_early_data, run_tunnel};
-use crate::websocket::WebSocketConnection;
+use crate::websocket::WebSocketStream;
 use worker::*;
 
 #[event(fetch)]
@@ -8,8 +8,8 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let user_id = env.var("USER_ID")?.to_string();
 
     // ready early data
-    let early_data = req.headers().get("sec-websocket-protocol")?;
-    let early_data = parse_early_data(early_data)?;
+    let swp = req.headers().get("sec-websocket-protocol")?;
+    let early_data = parse_early_data(swp)?;
 
     // Accept / handle a websocket connection
     let pair = WebSocketPair::new()?;
@@ -19,20 +19,18 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     wasm_bindgen_futures::spawn_local(async move {
         let event_stream = server.events().expect("could not open stream");
 
-        let socket = WebSocketConnection::new(&server, event_stream, early_data);
+        let socket = WebSocketStream::new(&server, event_stream, early_data);
 
         // run vless tunnel
-        match run_tunnel(socket, &user_id).await {
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::InvalidData
-                    || err.kind() == std::io::ErrorKind::ConnectionAborted
-                {
-                    server
-                        .close(Some(1003), Some("Unsupported data"))
-                        .unwrap_or_default()
-                }
+        if let Err(err) = run_tunnel(socket, &user_id).await {
+            if err.kind() == std::io::ErrorKind::InvalidData
+                || err.kind() == std::io::ErrorKind::ConnectionAborted
+            {
+                server
+                    .close(Some(1003), Some("invalid request"))
+                    .unwrap_or_default()
             }
-            _ => (),
+            console_debug!("run tunnel error: {}", err);
         }
     });
 
@@ -43,33 +41,30 @@ mod proxy {
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::websocket::WebSocketConnection;
-    use base64_url::decode;
-    use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+    use crate::websocket::WebSocketStream;
+    use base64::{decode_config, URL_SAFE_NO_PAD};
+    use tokio::io::{copy_bidirectional, AsyncReadExt};
     use worker::{console_debug, Socket};
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
-            if data.len() > 0 {
-                let data = data.replace("+", "-").replace("/", "_").replace("=", "");
-                match decode(&data) {
+            if !data.is_empty() {
+                let s = data.replace('+', "-").replace('/', "_").replace("=", "");
+                match decode_config(s, URL_SAFE_NO_PAD) {
                     Ok(early_data) => return Ok(Some(early_data)),
-                    Err(err) => return Err(Error::new(ErrorKind::Other, err)),
+                    Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
                 }
             }
         }
         Ok(None)
     }
 
-    pub async fn run_tunnel(
-        mut server_socket: WebSocketConnection<'_>,
-        user_id: &str,
-    ) -> Result<()> {
+    pub async fn run_tunnel(mut client_socket: WebSocketStream<'_>, user_id: &str) -> Result<()> {
         // process request
 
         // read version
         let mut prefix = [0u8; 18];
-        server_socket.read_exact(&mut prefix).await?;
+        client_socket.read_exact(&mut prefix).await?;
 
         if prefix[0] != 0 {
             return Err(std::io::Error::new(
@@ -87,7 +82,7 @@ mod proxy {
             if b1 != b2 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "Unknown user id",
+                    "invalid user id",
                 ));
             }
         }
@@ -95,13 +90,13 @@ mod proxy {
         {
             // ignore addons
             let addon_length = prefix[17];
-            let mut addon_bytes = allocate_vec(addon_length as usize).into_boxed_slice();
-            server_socket.read_exact(&mut addon_bytes).await?;
+            let mut addon_bytes = vec![0; addon_length as usize].into_boxed_slice();
+            client_socket.read_exact(&mut addon_bytes).await?;
         }
 
         // parse remote address
         let mut address_prefix = [0u8; 4];
-        server_socket.read_exact(&mut address_prefix).await?;
+        client_socket.read_exact(&mut address_prefix).await?;
 
         match address_prefix[0] {
             1 => {
@@ -116,7 +111,7 @@ mod proxy {
             unknown_protocol_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Unknown requested protocol: {}", unknown_protocol_type),
+                    format!("invalid requested protocol: {}", unknown_protocol_type),
                 ));
             }
         }
@@ -127,7 +122,7 @@ mod proxy {
             1 => {
                 // 4 byte ipv4 address
                 let mut address_bytes = [0u8; 4];
-                server_socket.read_exact(&mut address_bytes).await?;
+                client_socket.read_exact(&mut address_bytes).await?;
 
                 let v4addr: Ipv4Addr = Ipv4Addr::new(
                     address_bytes[0],
@@ -140,17 +135,17 @@ mod proxy {
             2 => {
                 // domain name
                 let mut domain_name_len = [0u8; 1];
-                server_socket.read_exact(&mut domain_name_len).await?;
+                client_socket.read_exact(&mut domain_name_len).await?;
 
-                let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
-                server_socket.read_exact(&mut domain_name_bytes).await?;
+                let mut domain_name_bytes = vec![0; domain_name_len[0] as usize];
+                client_socket.read_exact(&mut domain_name_bytes).await?;
 
                 let address_str = match std::str::from_utf8(&domain_name_bytes) {
                     Ok(s) => s,
                     Err(e) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Failed to decode address: {}", e),
+                            format!("invalid address: {}", e),
                         ));
                     }
                 };
@@ -159,7 +154,7 @@ mod proxy {
             3 => {
                 // 16 byte ipv6 address
                 let mut address_bytes = [0u8; 16];
-                server_socket.read_exact(&mut address_bytes).await?;
+                client_socket.read_exact(&mut address_bytes).await?;
 
                 let v6addr = Ipv6Addr::new(
                     ((address_bytes[0] as u16) << 8) | (address_bytes[1] as u16),
@@ -171,12 +166,12 @@ mod proxy {
                     ((address_bytes[12] as u16) << 8) | (address_bytes[13] as u16),
                     ((address_bytes[14] as u16) << 8) | (address_bytes[15] as u16),
                 );
-                format!("[{}]", v6addr.to_string())
+                format!("[{}]", v6addr)
             }
             invalid_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Invalid address type: {}", invalid_type),
+                    format!("invalid address type: {}", invalid_type),
                 ));
             }
         };
@@ -199,15 +194,7 @@ mod proxy {
             }
         };
 
-        // write response
-        server_socket
-            .write(&[
-                0u8, // version
-                0u8, // addons length
-            ])
-            .await?;
-
-        copy_bidirectional(&mut server_socket, &mut remote_socket).await?;
+        copy_bidirectional(&mut client_socket, &mut remote_socket).await?;
 
         Ok(())
     }
@@ -230,15 +217,6 @@ mod proxy {
         }
         bytes.into_boxed_slice()
     }
-
-    #[inline]
-    fn allocate_vec<T>(len: usize) -> Vec<T> {
-        let mut ret = Vec::with_capacity(len);
-        unsafe {
-            ret.set_len(len);
-        }
-        ret
-    }
 }
 
 mod websocket {
@@ -255,20 +233,21 @@ mod websocket {
     use worker::{EventStream, WebSocket, WebsocketEvent};
 
     #[pin_project]
-    pub struct WebSocketConnection<'a> {
+    pub struct WebSocketStream<'a> {
         ws: &'a WebSocket,
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
+        init_state: bool,
     }
 
-    impl<'a> WebSocketConnection<'a> {
+    impl<'a> WebSocketStream<'a> {
         pub fn new(
             ws: &'a WebSocket,
             stream: EventStream<'a>,
             early_data: Option<Vec<u8>>,
         ) -> Self {
-            let mut buff = BytesMut::with_capacity(4096);
+            let mut buff = BytesMut::new();
             if let Some(data) = early_data {
                 buff.put_slice(&data)
             }
@@ -277,54 +256,63 @@ mod websocket {
                 ws,
                 stream,
                 buffer: buff,
+                init_state: true,
             }
         }
     }
 
-    impl<'a> AsyncRead for WebSocketConnection<'a> {
+    impl<'a> AsyncRead for WebSocketStream<'a> {
         fn poll_read(
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
-            let this = self.project();
+            let mut this = self.project();
 
-            let amt = std::cmp::min(this.buffer.len(), buf.remaining());
-            if amt > 0 {
-                buf.put_slice(&this.buffer.split_to(amt));
-                return Poll::Ready(Ok(()));
-            }
-
-            match this.stream.poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                    if let Some(data) = msg.bytes() {
-                        this.buffer.put_slice(&data);
-
-                        let amt = std::cmp::min(this.buffer.len(), buf.remaining());
-                        if amt > 0 {
-                            buf.put_slice(&this.buffer.split_to(amt));
-                        }
-                    };
+            loop {
+                let amt = std::cmp::min(this.buffer.len(), buf.remaining());
+                if amt > 0 {
+                    buf.put_slice(&this.buffer.split_to(amt));
                     return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(None) | Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
-                    return Poll::Ready(Err(Error::new(ErrorKind::Other, "Connection closed")))
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+
+                match this.stream.as_mut().poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
+                        if let Some(data) = msg.bytes() {
+                            this.buffer.put_slice(&data);
+                        };
+                        continue;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+                    }
+                    _ => return Poll::Ready(Ok(())), // None or Close event, return Ok to indicate stream end
                 }
             }
         }
     }
 
-    impl<'a> AsyncWrite for WebSocketConnection<'a> {
+    impl<'a> AsyncWrite for WebSocketStream<'a> {
         fn poll_write(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<Result<usize>> {
             let this = self.project();
+
+            if *this.init_state {
+                // 发送第一个包时需要加上 vless 的协议 response 头
+                *this.init_state = false;
+
+                return match this
+                    .ws
+                    .send_with_bytes([&[0u8, 0u8], buf].concat().to_vec().as_slice())
+                {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
+                };
+            }
 
             match this.ws.send_with_bytes(buf) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
@@ -338,7 +326,7 @@ mod websocket {
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
             let this = self.project();
-            match this.ws.close(None, Some("Normal close")) {
+            match this.ws.close(None, Some("normal close")) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
             }
